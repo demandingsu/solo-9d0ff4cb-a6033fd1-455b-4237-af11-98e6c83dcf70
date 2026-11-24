@@ -18,7 +18,6 @@ from .planner import (
     MAX_RUN_MINUTES,
     PlanError,
     Span,
-    reconstruct_spans,
     spans_from_missing_ranges,
 )
 
@@ -457,19 +456,42 @@ class ArchiveStore:
                     f"archive {archive.run_id!r} has conflicting duplicate points"
                 )
             anchors[offset] = value
+        # Every retained point must lie inside a measured span; missing minutes
+        # never carry anchors and never get bridged.
+        covered = [
+            offset
+            for offset in anchors
+            if not any(
+                span_start <= offset < span_end for span_start, span_end in spans
+            )
+        ]
+        if covered:
+            raise ArchiveCorrupt(
+                f"archive {archive.run_id!r} has a retained point at missing "
+                f"minute {min(covered)}"
+            )
+        if len(anchors) != archive.retained_count:
+            raise ArchiveCorrupt(
+                f"archive {archive.run_id!r} has duplicate retained offsets"
+            )
+        # Each span must keep both endpoints, and consecutive anchors inside a
+        # span must be strictly increasing so the polyline can rebuild it.
         for span_start, span_end in spans:
             if span_start not in anchors or span_end - 1 not in anchors:
                 raise ArchiveCorrupt(
                     f"archive {archive.run_id!r} does not retain the endpoints "
                     f"of span {span_start}..{span_end - 1}"
                 )
-        if len(anchors) != archive.retained_count:
-            raise ArchiveCorrupt(
-                f"archive {archive.run_id!r} has duplicate retained offsets"
+            local = sorted(
+                offset
+                for offset in anchors
+                if span_start <= offset < span_end
             )
-        # Reconstruction is bounded and deterministic; this also proves the
-        # stored anchors can actually rebuild the whole run.
-        reconstruct_spans(spans, anchors, archive.minute_count)
+            if any(left >= right for left, right in zip(local, local[1:])):
+                raise ArchiveCorrupt(
+                    f"archive {archive.run_id!r} has unordered anchors in span "
+                    f"{span_start}..{span_end - 1}"
+                )
 
     def get(self, run_id: str) -> Optional[StoredArchive]:
         connection = self._connect()

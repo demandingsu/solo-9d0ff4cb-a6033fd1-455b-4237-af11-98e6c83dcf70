@@ -40,9 +40,9 @@ from .models import (
 from .planner import (
     PlanError,
     classify,
-    in_band_intervals,
+    in_band_ranges_windowed,
     plan_archive,
-    reconstruct_spans,
+    reconstruct_window,
 )
 
 
@@ -131,10 +131,16 @@ def _load_archive(store: db.ArchiveStore, run_id: str) -> db.StoredArchive:
     return archive
 
 
-def _archive_values(archive: db.StoredArchive) -> list[Optional[int]]:
+def _archive_window_values(
+    archive: db.StoredArchive, offset_start: int, offset_end: int
+) -> list[Optional[int]]:
     try:
-        return reconstruct_spans(
-            archive.spans, dict(archive.retained_points), archive.minute_count
+        return reconstruct_window(
+            archive.spans,
+            dict(archive.retained_points),
+            archive.minute_count,
+            offset_start,
+            offset_end,
         )
     except PlanError as exc:  # pragma: no cover - guarded at insert time
         raise ApiError(
@@ -375,10 +381,11 @@ def create_app() -> FastAPI:
                 f"requested {start_minute_utc}..{end_minute_utc}",
             )
 
-        values = _archive_values(archive)
         offset_start = start_minute_utc - archive.start_minute_utc
         offset_end = end_minute_utc - archive.start_minute_utc + 1
-        window = values[offset_start:offset_end]
+        # Only the requested minutes are reconstructed; the rest of the run is
+        # never interpolated just to answer a narrow query.
+        window = _archive_window_values(archive, offset_start, offset_end)
 
         minutes: list[MinuteSample] = []
         missing_minutes: list[int] = []
@@ -406,23 +413,35 @@ def create_app() -> FastAPI:
                 )
             )
 
-        # In-band periods are a property of the whole archived run, so compute
-        # them across the run and return those overlapping the requested range.
-        full_intervals = in_band_intervals(
-            values,
-            archive.band_low_tenths_c,
-            archive.band_high_tenths_c,
-            archive.start_minute_utc,
-        )
+        # In-band periods are a property of the whole archived run.  Find the
+        # runs that touch the query window from the reconstructed window
+        # values, then extend each to its true boundaries via binary searches
+        # over the retained anchor pairs — no per-minute scan outside the
+        # window and no second whole-run reconstruction.
+        try:
+            full_ranges = in_band_ranges_windowed(
+                archive.spans,
+                dict(archive.retained_points),
+                archive.minute_count,
+                offset_start,
+                offset_end,
+                window,
+                archive.band_low_tenths_c,
+                archive.band_high_tenths_c,
+            )
+        except PlanError as exc:  # pragma: no cover - guarded at insert time
+            raise ApiError(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "archive_corrupt",
+                f"stored archive cannot be reconstructed: {exc}",
+            ) from exc
         intervals = [
             BandInterval(
-                start_minute_utc=item["start_minute"],
-                end_minute_utc=item["end_minute"],
-                duration_minutes=item["duration_minutes"],
+                start_minute_utc=archive.start_minute_utc + range_start,
+                end_minute_utc=archive.start_minute_utc + range_end,
+                duration_minutes=range_end - range_start + 1,
             )
-            for item in full_intervals
-            if item["start_minute"] <= end_minute_utc
-            and item["end_minute"] >= start_minute_utc
+            for range_start, range_end in full_ranges
         ]
 
         return ArchiveQueryResponse(

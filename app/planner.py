@@ -37,6 +37,7 @@ each is well within the 360-minute bound.
 
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from typing import Mapping, Optional, Sequence
 
@@ -263,6 +264,66 @@ def reconstruct_spans(
     return rebuilt
 
 
+def reconstruct_window(
+    spans: Sequence[Span],
+    anchors: Mapping[int, int],
+    minute_count: int,
+    offset_start: int,
+    offset_end: int,
+) -> list[Optional[int]]:
+    """Rebuild only offsets ``[offset_start, offset_end)`` from retained anchors.
+
+    The per-minute interpolation work is proportional to the requested window,
+    not to the whole run: anchor segments fully outside the window are never
+    interpolated, and at most one anchor on each side of the window is read as
+    an interpolation source.  Offsets inside a missing range stay ``None``
+    (they are never bridged).  The interpolation and rounding rules are exactly
+    those of :func:`reconstruct_spans`.
+    """
+    if offset_start < 0 or offset_end > minute_count or offset_start > offset_end:
+        raise PlanError("reconstruction window is outside the run")
+    width = offset_end - offset_start
+    rebuilt: list[Optional[int]] = [None] * width
+    if width == 0:
+        return rebuilt
+    offsets = sorted(anchors)
+    for span_start, span_end in spans:
+        if span_end <= offset_start or span_start >= offset_end:
+            continue
+        first_in_span = bisect_left(offsets, span_start)
+        last_in_span = bisect_left(offsets, span_end) - 1
+        # Include the nearest anchor just outside the window on either side so
+        # that interpolation across the window boundary stays exact.
+        left = max(first_in_span, bisect_right(offsets, offset_start - 1) - 1)
+        right = min(last_in_span, bisect_left(offsets, offset_end))
+        if left > right or offsets[left] > offsets[right]:
+            raise PlanError(
+                f"real-sample span {span_start}..{span_end - 1} cannot rebuild "
+                "the requested window from its retained anchors"
+            )
+        local = offsets[left : right + 1]
+        if local[0] != span_start and local[0] >= offset_start:
+            raise PlanError(
+                f"real-sample span {span_start}..{span_end - 1} does not retain "
+                "its first sample"
+            )
+        for left_offset, right_offset in zip(local, local[1:]):
+            fill_start = max(left_offset + 1, offset_start)
+            fill_end = min(right_offset, offset_end)
+            for offset in range(fill_start, fill_end):
+                rebuilt[offset - offset_start] = reconstruct_between(
+                    left_offset,
+                    anchors[left_offset],
+                    right_offset,
+                    anchors[right_offset],
+                    offset,
+                )
+        for offset in local:
+            if offset_start <= offset < offset_end:
+                rebuilt[offset - offset_start] = anchors[offset]
+    return rebuilt
+
+
 def reconstruct_run(
     readings: Sequence[Optional[int]], retained_offsets: Sequence[int]
 ) -> list[Optional[int]]:
@@ -435,3 +496,197 @@ def in_band_intervals(
             }
         )
     return intervals
+
+
+def _pair_band_offsets(
+    left: int,
+    left_value: int,
+    right: int,
+    right_value: int,
+    low: int,
+    high: int,
+) -> Optional[tuple[int, int]]:
+    """Offsets inside an anchor pair whose rounded interpolation is in band.
+
+    The rounded values along one straight anchor pair are monotone
+    (non-strictly), so the in-band offsets form one contiguous slice, found
+    with binary searches instead of a per-minute scan.  Returns ``None`` when
+    no minute of the pair is inside the band.
+    """
+    width = right - left
+
+    def value_at(offset: int) -> int:
+        return reconstruct_between(left, left_value, right, right_value, offset)
+
+    if left_value <= right_value:
+        # Non-decreasing: first offset at or above low, first above high.
+        lo = bisect_left(
+            range(width + 1), True, key=lambda off: value_at(left + off) >= low
+        )
+        hi = bisect_left(
+            range(width + 1), True, key=lambda off: value_at(left + off) > high
+        )
+        if lo >= hi:
+            return None
+        return left + lo, left + hi - 1
+
+    # Non-increasing: first offset at or below high, first below low.
+    lo = bisect_left(
+        range(width + 1), True, key=lambda off: value_at(left + off) <= high
+    )
+    hi = bisect_left(
+        range(width + 1), True, key=lambda off: value_at(left + off) < low
+    )
+    if lo >= hi:
+        return None
+    return left + lo, left + hi - 1
+
+
+def _anchor_pair_slice(
+    local: Sequence[int],
+    anchors: Mapping[int, int],
+    pair_index: int,
+    low: int,
+    high: int,
+    cache: dict[int, Optional[tuple[int, int]]],
+) -> Optional[tuple[int, int]]:
+    """Cached in-band ``[start, end]`` slice of one anchor pair."""
+    left, right = local[pair_index], local[pair_index + 1]
+    return cache.setdefault(
+        left,
+        _pair_band_offsets(
+            left, anchors[left], right, anchors[right], low, high
+        ),
+    )
+
+
+def _walk_left(
+    edge_pair: int,
+    local: Sequence[int],
+    anchors: Mapping[int, int],
+    low: int,
+    high: int,
+    cache: dict[int, Optional[tuple[int, int]]],
+) -> int:
+    """Start offset of the in-band run containing anchor pair ``edge_pair``."""
+    index = edge_pair
+    while index > 0:
+        band = _anchor_pair_slice(local, anchors, index, low, high, cache)
+        # Cross into the previous pair only when this pair's band reaches its
+        # own left anchor (the shared minute is in band); otherwise the run
+        # starts strictly inside this pair.
+        if band is None or band[0] > local[index]:
+            return band[0] if band is not None else local[index]
+        index -= 1
+    band = _anchor_pair_slice(local, anchors, 0, low, high, cache)
+    if band is None:  # pragma: no cover - edge pair is known to be in band
+        return local[0]
+    return band[0]
+
+
+def _walk_right(
+    edge_pair: int,
+    local: Sequence[int],
+    anchors: Mapping[int, int],
+    low: int,
+    high: int,
+    cache: dict[int, Optional[tuple[int, int]]],
+) -> int:
+    """End offset of the in-band run containing anchor pair ``edge_pair``."""
+    index = edge_pair
+    last_pair = len(local) - 2
+    while index < last_pair:
+        band = _anchor_pair_slice(local, anchors, index, low, high, cache)
+        # Cross into the next pair only when this pair's band reaches its own
+        # right anchor (the shared minute is in band); otherwise the run ends
+        # strictly inside this pair.
+        if band is None or band[1] < local[index + 1]:
+            return band[1] if band is not None else local[index + 1]
+        index += 1
+    band = _anchor_pair_slice(local, anchors, last_pair, low, high, cache)
+    if band is None:  # pragma: no cover - edge pair is known to be in band
+        return local[-1]
+    return band[1]
+
+def in_band_ranges_windowed(
+    spans: Sequence[Span],
+    anchors: Mapping[int, int],
+    minute_count: int,
+    offset_start: int,
+    offset_end: int,
+    window_values: Sequence[Optional[int]],
+    low: int,
+    high: int,
+) -> list[tuple[int, int]]:
+    """Full in-band offset ranges of every period overlapping the query window.
+
+    The runs touching the window are first found by scanning the already
+    reconstructed ``window_values`` (a per-minute scan limited to the query
+    range).  Each run is then extended to its true run boundaries by walking
+    the retained anchor pairs of its measured span, locating each pair's
+    in-band slice with binary searches.  Minutes outside the query window are
+    never scanned or reconstructed; missing minutes (the gaps between spans)
+    break the runs exactly as before.  Returned ranges are inclusive
+    ``[start_offset, end_offset]`` pairs.
+    """
+    if not (0 <= offset_start <= offset_end <= minute_count):
+        raise PlanError("query window is outside the run")
+    ranges: list[tuple[int, int]] = []
+    cache: dict[int, Optional[tuple[int, int]]] = {}
+    span_ends = [span[1] for span in spans]
+    cursor = offset_start
+    while cursor < offset_end:
+        value = window_values[cursor - offset_start]
+        if value is None or not low <= value <= high:
+            cursor += 1
+            continue
+        run_start = run_end = cursor
+        cursor += 1
+        while cursor < offset_end:
+            value = window_values[cursor - offset_start]
+            if value is None or not low <= value <= high:
+                break
+            run_end = cursor
+            cursor += 1
+        span_index = bisect_right(span_ends, run_start)
+        if span_index >= len(spans):
+            raise PlanError("in-band minute is outside every measured span")
+        span_start, span_end = spans[span_index]
+        local = sorted(
+            offset
+            for offset in anchors
+            if span_start <= offset < span_end
+        )
+        if not local or local[0] != span_start or local[-1] != span_end - 1:
+            raise PlanError(
+                f"real-sample span {span_start}..{span_end - 1} does not retain "
+                "its first and last sample"
+            )
+        if len(local) == 1:
+            # A one-minute measured span is its own (single) run.
+            ranges.append((local[0], local[0]))
+            continue
+
+        # Anchor pair whose interior contains the run's first window minute.
+        # An edge exactly on an anchor belongs to the pair starting there.
+        first_pair = bisect_right(local, run_start) - 1
+        if first_pair < 0:
+            first_pair = 0
+        elif first_pair >= len(local) - 1:
+            first_pair = len(local) - 2
+        full_start = _walk_left(
+            first_pair, local, anchors, low, high, cache
+        )
+        full_end = _walk_right(
+            first_pair, local, anchors, low, high, cache
+        )
+        # Window runs that are pieces of the same whole-run interval (they
+        # join through anchors/pairs outside the window) produce overlapping
+        # ranges; merge those.  Merely adjacent ranges stay separate, since
+        # the minute between them is out of band or missing.
+        if ranges and full_start <= ranges[-1][1]:
+            previous_start, previous_end = ranges[-1]
+            ranges[-1] = (previous_start, max(previous_end, full_end))
+        else:
+            ranges.append((full_start, full_end))
+    return ranges
